@@ -1,4 +1,6 @@
 from transformers import PretrainedConfig
+import torch
+import torch.nn as nn
 
 class MiniMindConfig(PretrainedConfig):
     model_type = "minimind"
@@ -36,3 +38,22 @@ class MiniMindConfig(PretrainedConfig):
         self.moe_intermediate_size = kwargs.get("moe_intermediate_size", self.intermediate_size)
         self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
         self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter((torch.ones(dim)))
+
+    """
+    x shape: [batch_size, seq_len, dim]
+    eg: (2, 3, 4) : 一共两句话，每句话三个token(词),每个token的维度是4
+    对每个token进行归一化
+    最后的输出也是 [batch_size, seq_len, dim]，每个token的维度是4，且每个token的值被归一化了
+    """
+    def norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+    
+    def forward(self, x):
+        return (self.weight * self.norm(x.float())).type_as(x)
