@@ -147,6 +147,9 @@ class Attention(nn.Module):
         # 应用旋转位置编码RoPE，把位置信息融入到Q和K中
         cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
+
+        # 推理阶段才用到缓存的K,V，训练阶段每次输入一个完整的序列，不需要缓存
+        
         if past_key_value is not None:
             # 如果有缓存的K,V，把它们和当前的K,V拼接起来，形成完整的历史+当前的K,V
             xk = torch.cat([past_key_value[0], xk], dim=1) # [batch_size, total_seq_len, num_kv_heads, head_dim]
@@ -200,3 +203,44 @@ class MiniMindBlock(nn.Module):
         hidden_states = residual + hidden_states  # 注意力的残差连接
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
         return hidden_states, present_key_value
+
+
+class MiniMindModel(nn.Module):
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers  # 词表大小和层数
+        # 词嵌入层，把输入的token id shape:[batch, seq_len]  转换成向量表示，shape: [batch, seq_len, hidden_size]
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout)
+        # Transformer层, 每层包含一个多头注意力子层和一个前馈网络子层，层与层之间有残差连接和归一化
+        self.layers = nn.ModuleList([MiniMindBlock(i, config) for i in range(self.num_hidden_layers)])
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # 预计算RoPE的位置编码，存储在模型的buffer中，方便后续使用
+        freqs_cos, freqs_sin = precompute_freqs_cis(config.head_dim, end=config.max_position_embeddings, rope_base=config.rope_theta, rope_scaling=config.rope_scaling)
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+    def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, **kwargs):
+        """
+        input_ids shape: [batch_size, seq_len]
+        attention_mask shape: [batch_size, seq_len], 1表示需要关注的位置，0表示不需要关注的位置
+        past_key_values: list of tuples, 每个tuple包含一个注意力层的缓存的K,V，shape: [batch_size, total_seq_len, num_kv_heads, head_dim]
+        use_cache: 是否返回新的缓存的K,V
+        """
+        batch_size, seq_length = input_ids.shape
+        if hasattr(past_key_values, 'layers'): past_key_values = None   # 兼容 HuggingFace 的缓存格式
+        past_key_values = past_key_values or [None] * len(self.layers)  # 如果没有提供缓存的K,V，就创建一个全None的列表，表示每层都没有缓存,  确保循环时每层都有对应的缓存（即使是 None）
+        # 计算当前输入是序列的第几个位置，等于之前缓存的K,V的长度，因为每个位置对应一个K,V，所以缓存的长度就是已经处理过的序列长度
+        # past_key_values[0]：第0层的缓存 (K, V), past_key_values[0][0]：第0层的 K 缓存, past_key_values[0][0].shape = [batch, seq_len, heads, head_dim], 所有层的 K,V 的 seq_len 都是一样的，等于已经处理过的序列长度
+        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0  # 计算当前输入的起始位置，等于缓存的K,V的长度
+        hidden_states = self.dropout(self.embed_tokens(input_ids))
+        position_embeddings = (self.freqs_cos[start_pos : start_pos + seq_length], self.freqs_sin[start_pos : start_pos + seq_length])  # 获取当前输入位置对应的RoPE位置编码
+        presents = []
+        for layer, past_key_values in zip(self.layers, past_key_values):
+            hidden_states, present = layer(
+                hidden_states, position_embeddings, past_key_values, use_cache, attention_mask=attention_mask
+            )
+            presents.append(present)
+        hidden_states = self.norm(hidden_states)  # 最后再进行一次归一化
+        return hidden_states, presents
