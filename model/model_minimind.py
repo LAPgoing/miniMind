@@ -1,6 +1,7 @@
 import math
 
 from transformers import PretrainedConfig
+from transformers.activations import ACT2FN 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -21,7 +22,7 @@ class MiniMindConfig(PretrainedConfig):
         self.num_key_value_heads = kwargs.get("num_key_value_heads", 4)
         self.head_dim = kwargs.get("head_dim", self.hidden_size // self.num_attention_heads)
         self.hidden_act = kwargs.get("hidden_act", 'silu')
-        self.intermediate_size = kwargs.get("intermediate_size", math.ceil(hidden_size * math.pi / 64) * 64)
+        self.intermediate_size = kwargs.get("intermediate_size", math.ceil(hidden_size * math.pi / 64) * 64)  # 升维的维度
         self.max_position_embeddings = kwargs.get("max_position_embeddings", 32768)
         self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-6)
         self.rope_theta = kwargs.get("rope_theta", 1e6)
@@ -168,3 +169,15 @@ class Attention(nn.Module):
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)   # [batch_size, seq_len, num_heads * head_dim]
         output = self.resid_dropout(self.o_proj(output))  # 最后通过输出投影，并添加残差连接的dropout
         return output, past_kv
+    
+class FeedForward(nn.Module):
+    def __init__(self, config: MiniMindConfig, intermediate_size: int = None):
+        super().__init__()
+        self.intermediate_size = intermediate_size if intermediate_size is not None else config.intermediate_size
+        self.gate_proj = nn.Linear(config.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, config.hidden_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act]  # 激活函数
+
+    def forward(self, x):
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)) # 维度: [batch_size, seq_len, hidden_size] -> [batch_size, seq_len, intermediate_size] -> [batch_size, seq_len, hidden_size]
