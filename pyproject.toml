@@ -8,6 +8,7 @@ dependencies = [
     "numpy==1.26.4",
     "torch==1.13.1+cu117",
     "transformers==4.36.0",
+    "datasets==2.14.6",
 ]
 
 
