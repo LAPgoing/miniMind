@@ -1,10 +1,11 @@
 import math
 
-from transformers import PretrainedConfig
+from transformers import GenerationMixin, PreTrainedModel, PretrainedConfig
 from transformers.activations import ACT2FN 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 class MiniMindConfig(PretrainedConfig):
     model_type = "minimind"
@@ -149,7 +150,7 @@ class Attention(nn.Module):
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
 
         # 推理阶段才用到缓存的K,V，训练阶段每次输入一个完整的序列，不需要缓存
-        
+
         if past_key_value is not None:
             # 如果有缓存的K,V，把它们和当前的K,V拼接起来，形成完整的历史+当前的K,V
             xk = torch.cat([past_key_value[0], xk], dim=1) # [batch_size, total_seq_len, num_kv_heads, head_dim]
@@ -237,10 +238,37 @@ class MiniMindModel(nn.Module):
         hidden_states = self.dropout(self.embed_tokens(input_ids))
         position_embeddings = (self.freqs_cos[start_pos : start_pos + seq_length], self.freqs_sin[start_pos : start_pos + seq_length])  # 获取当前输入位置对应的RoPE位置编码
         presents = []
-        for layer, past_key_values in zip(self.layers, past_key_values):
+        for layer, past_key_value in zip(self.layers, past_key_values):
             hidden_states, present = layer(
-                hidden_states, position_embeddings, past_key_values, use_cache, attention_mask=attention_mask
+                hidden_states, position_embeddings, past_key_value, use_cache, attention_mask=attention_mask
             )
             presents.append(present)
         hidden_states = self.norm(hidden_states)  # 最后再进行一次归一化
         return hidden_states, presents
+
+
+class MiniMindCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = MiniMindConfig 
+    def __init__(self, config: MiniMindConfig = None):
+        self.config = config or MiniMindConfig()
+        super().__init__(config)
+        self.model = MiniMindModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.tie_word_embeddings:
+            self.model.embed_tokens.weight = self.lm_head.weight  # 词嵌入层和输出层共享权重
+        self.post_init()  # HuggingFace 的权重初始化方法
+
+    def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, logits_to_keep=0, **kwargs):
+        """
+        logits_to_keep: int, 在推理阶段，为了节省显存，可以只返回最后几个token的logits，默认为0，表示返回所有token的logits
+        """
+        hidden_states, past_key_values = self.model(
+            input_ids, attention_mask, past_key_values, use_cache, **kwargs
+        )
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])  # 只计算最后几个token的logits，节省显存
+        return CausalLMOutputWithPast(
+            logits=logits,  # [batch_size, slice_len, vocab_size] 概率分布，表示每个位置预测下一个token的概率
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+        )
