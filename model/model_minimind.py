@@ -163,8 +163,8 @@ class Attention(nn.Module):
             if self.is_causal:
                 scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)  # 添加因果掩码，确保每个位置只能关注之前的位置
             # 注意力掩码, 屏蔽掉padding等不需要关注的位置，确保模型不会把注意力放在这些位置上(处理变长输入)
-            if attention_mask is not None:
-                scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9  # 添加注意力掩码，屏蔽掉padding等不需要关注的位置
+            if attention_mask is not None:  # attention_mask shape: [batch_size, seq_len], 1表示需要关注的位置，0表示不需要关注的位置
+                scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9  # 添加注意力掩码，屏蔽掉padding等不需要关注的位置, shape: [batch_size, 1, 1, seq_len], 广播机制自动补齐
             output = self.attn_dropout(F.softmax(scores, dim=-1)) @ xv
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)   # [batch_size, seq_len, num_heads * head_dim]
         output = self.resid_dropout(self.o_proj(output))  # 最后通过输出投影，并添加残差连接的dropout
@@ -181,3 +181,22 @@ class FeedForward(nn.Module):
 
     def forward(self, x):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)) # 维度: [batch_size, seq_len, hidden_size] -> [batch_size, seq_len, intermediate_size] -> [batch_size, seq_len, hidden_size]
+    
+
+class MiniMindBlock(nn.Module):
+    def __int__(self, layer_id: int, config: MiniMindConfig):
+        super().__init__()
+        self.self_attn = Attention(config)  # 多头注意力层
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)  # 注意力层的输入归一化
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps) # FNN层的输入归一化
+        self.mlp = FeedForward(config) 
+    
+    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        residual = hidden_states
+        hidden_states, present_key_value =self.self_attn(
+            self.input_layernorm(hidden_states), position_embeddings, 
+            past_key_value, use_cache, attention_mask
+        )
+        hidden_states = residual + hidden_states  # 注意力的残差连接
+        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        return hidden_states, present_key_value
